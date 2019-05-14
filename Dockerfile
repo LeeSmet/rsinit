@@ -1,6 +1,6 @@
 FROM ubuntu:bionic
 RUN apt-get update
-RUN apt-get install -y  openssh-server
+RUN apt-get install -y  openssh-server haveged udev
 RUN apt-get clean
 
 COPY rsinit /sbin/

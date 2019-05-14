@@ -1,16 +1,36 @@
 use librsinit::ensure_process;
+use simplelog::*;
+use std::fs::OpenOptions;
 use std::thread;
 
+const PROCESSES: [(&'static str, &'static str); 2] =
+    [("/usr/sbin/sshd", "-D"), ("/usr/sbin/haveged", "")];
+
 fn main() {
-    let logger = pretty_env_logger::formatted_builder()
-        .filter_level(log::LevelFilter::Trace)
-        .build();
+    WriteLogger::init(
+        log::LevelFilter::Trace,
+        Config::default(),
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open("/log")
+            .expect("Failed to open log file"),
+    )
+    .expect("Failed to set up logger");
 
-    log::set_boxed_logger(Box::new(logger)).expect("Failed to set logger");
+    let mut handles = Vec::with_capacity(PROCESSES.len());
 
-    let handle = thread::spawn(|| {
-        ensure_process("/usr/sbin/sshd", "-D");
-    });
+    for (process, args) in &PROCESSES {
+        let handle = thread::spawn(move || {
+            ensure_process(process, args);
+        });
 
-    handle.join().unwrap();
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
