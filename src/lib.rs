@@ -18,10 +18,10 @@ use signal::trap::Trap;
 use signal::Signal::*;
 
 #[derive(Clone, Debug)]
-pub struct Carcass {
-    pub pid: Pid,
-    pub status: Option<i32>,
-    pub signal: Option<Signal>,
+struct Carcass {
+    pid: Pid,
+    status: Option<i32>,
+    signal: Option<Signal>,
 }
 
 impl fmt::Display for Carcass {
@@ -108,7 +108,6 @@ enum OrphanState {
     HasBeenSentSIGTERM(Pid),
     HasBeenSentSIGKILL(Pid, Instant),
     Errored(Pid, nix::Error),
-    Carcass(Carcass),
 }
 
 fn transition_orphan(os: OrphanState) -> OrphanState {
@@ -141,7 +140,6 @@ fn transition_orphan(os: OrphanState) -> OrphanState {
             );
             os
         }
-        os @ OrphanState::Carcass(_) => os,
         os @ OrphanState::Errored(_, _) => os,
     }
 }
