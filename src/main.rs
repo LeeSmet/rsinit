@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::thread;
 
 const PROCESSES: [(&'static str, &'static str); 2] =
-    [("/usr/sbin/sshd", "-D"), ("/usr/sbin/haveged", "")];
+    [("/usr/sbin/sshd", ""), ("/usr/sbin/haveged", "")];
 
 fn main() {
     WriteLogger::init(
@@ -20,6 +20,11 @@ fn main() {
     )
     .expect("Failed to set up logger");
 
+    // Start reaper
+    let reaper = librsinit::reaper::Reaper::new();
+
+    let reaper_handle = thread::spawn(move || reaper.spawn());
+
     let mut handles = Vec::with_capacity(PROCESSES.len());
 
     for (process, args) in &PROCESSES {
@@ -33,4 +38,5 @@ fn main() {
     for handle in handles {
         handle.join().unwrap();
     }
+    reaper_handle.join().unwrap();
 }

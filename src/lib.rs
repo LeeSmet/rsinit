@@ -1,45 +1,29 @@
 #[macro_use]
 extern crate log;
+
 use std::process::Command;
 use std::thread;
+
+pub mod reaper;
 
 pub fn ensure_process(name: &str, args: &str) {
     let formatted_args: Vec<&str> = args.split_whitespace().collect();
 
-    // try 3 times, then back of {
-    loop {
-        let mut cmd = Command::new(name);
-        cmd.args(&formatted_args);
+    let mut cmd = Command::new(name);
+    cmd.args(&formatted_args);
 
-        debug!("Spawning process {}", name);
-        let mut child;
+    debug!("Spawning process {}", name);
+    let mut child;
 
-        match spawn_process(&mut cmd) {
-            Some(ch) => child = ch,
-            None => {
-                error!("Failed to spawn {} ({})", name, args);
-                return;
-            }
-        }
-
-        info!("Spawned process {}", name);
-
-        match child.wait() {
-            Ok(code) => match code.success() {
-                true => {
-                    info!(
-                        "Process {} exited with code 0, assuming it forked itself",
-                        name
-                    );
-                    return;
-                }
-                _ => warn!("Process {} exited with code {}", name, code),
-            },
-            Err(e) => {
-                error!("Process {} errored: {}", name, e);
-            }
+    match spawn_process(&mut cmd) {
+        Some(ch) => child = ch,
+        None => {
+            error!("Failed to spawn {} ({})", name, args);
+            return;
         }
     }
+
+    info!("Spawned process {}, Pid: {}", name, child.id());
 }
 
 fn spawn_process(cmd: &mut Command) -> Option<std::process::Child> {
