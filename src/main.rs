@@ -1,4 +1,3 @@
-use librsinit::ensure_process;
 use simplelog::*;
 use std::fs::OpenOptions;
 use std::thread;
@@ -23,20 +22,7 @@ fn main() {
     // Start reaper
     let reaper = librsinit::reaper::Reaper::new();
 
-    let reaper_handle = thread::spawn(move || reaper.spawn());
+    let reaper_handle = thread::spawn(move || reaper.spawn(&PROCESSES));
 
-    let mut handles = Vec::with_capacity(PROCESSES.len());
-
-    for (process, args) in &PROCESSES {
-        let handle = thread::spawn(move || {
-            ensure_process(process, args);
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
     reaper_handle.join().unwrap();
 }

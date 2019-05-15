@@ -2,16 +2,20 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{read_dir, File};
 use std::io::Read;
+use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
 
+use nix::libc::pid_t;
 use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
+use nix::unistd::{getpid, Pid};
 
 use signal::trap::Trap;
 use signal::Signal::*;
+
+use crossbeam::channel::{unbounded, Receiver, Sender};
 
 #[derive(Clone, Debug)]
 pub struct Carcass {
@@ -33,7 +37,7 @@ impl fmt::Display for Carcass {
 /// reap executes waitpid, returning a zombie process ready to be reaped. This means it can't be
 /// used to wait for a specific pid to exit. If there is currently no zombie process, None is returned,
 /// else it returns a Carcass with information on how the process was terminated.
-pub fn reap() -> Option<Carcass> {
+fn reap() -> Option<Carcass> {
     match waitpid(None, Some(WaitPidFlag::WNOHANG)).unwrap() {
         WaitStatus::Exited(pid, st) => Some(Carcass {
             pid,
@@ -142,23 +146,69 @@ fn transition_orphan(os: OrphanState) -> OrphanState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ReaperNotification {
+    pub pid: u32,
+    pub children: Vec<u32>,
+    pub event: Event,
+}
+
+impl ReaperNotification {
+    fn new(pid: Pid, children: &[Pid], event: Event) -> Self {
+        let raw_pid: pid_t = pid.into();
+        ReaperNotification {
+            pid: raw_pid as u32,
+            children: children
+                .iter()
+                .map(|p| {
+                    let raw_pid: pid_t = (*p).into();
+                    raw_pid as u32
+                })
+                .collect(),
+            event,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    ExitSuccess,
+    ExitCode,
+    ExitSignal,
+}
+
 pub struct Reaper {
     orphans: HashMap<Pid, OrphanState>,
+    children: Vec<Pid>,
     trap: Trap,
+
+    persistent_commands_map: HashMap<Pid, Cmd>,
+
+    pid: Pid,
 }
+
+struct Cmd(String, String);
 
 impl Reaper {
     pub fn new() -> Self {
         Reaper {
             orphans: HashMap::new(),
+            children: Vec::new(),
             // it seems we need to set up the signal trap on the main thread, else it doesn't work
             trap: Trap::trap(&[SIGCHLD, SIGINT, SIGTERM]),
+
+            persistent_commands_map: HashMap::new(),
+
+            pid: getpid(),
         }
     }
 
-    pub fn spawn(mut self) {
-        // signals to trap and handle
-        // we only really care about SIGCHLD
+    pub fn spawn(mut self, persistent_commands: &[(&str, &str)]) {
+        for cmd in persistent_commands {
+            self.spawn_child(cmd.0, cmd.1).unwrap();
+        }
+        let _ = self.new_children(); // make sure we know about these processes
+
         loop {
             let deadline = Instant::now() + Duration::from_secs(1);
 
@@ -169,7 +219,7 @@ impl Reaper {
                         // received sigchld, try to get a carcass
                         if let Some(carcass) = reap() {
                             // got a dead process
-                            match carcass {
+                            let event = match carcass {
                                 // if the process exited normally, i.e. exit code 0, everything is fine
                                 // if the process did not exit with 0, or it was signaled, kill all of its
                                 // children
@@ -182,6 +232,7 @@ impl Reaper {
                                     "Reaped carcass of {}, exited with code 0, children can live",
                                     pid
                                 );
+                                    Event::ExitSuccess
                                 }
                                 Carcass {
                                     pid,
@@ -192,7 +243,7 @@ impl Reaper {
                                     "Reaped carcass of {}, exited with code {}, killing children",
                                     pid, code
                                 );
-                                    self.mark_children(pid);
+                                    Event::ExitCode
                                 }
                                 Carcass {
                                     pid,
@@ -203,11 +254,31 @@ impl Reaper {
                                         "Reaped {}, exited with signal {:?}, killing children",
                                         pid, sig
                                     );
-                                    self.mark_children(pid);
+                                    Event::ExitSignal
                                 }
                                 _ => unreachable!(), // we always have either signal or status set
+                            };
+
+                            // get a list of children for this process
+                            // this also forgets the current carcass pid as a child
+                            let children = self.new_children();
+                            debug!("Reaped process has {} children", children.len());
+
+                            // see if the children need to be marked
+                            match event {
+                                Event::ExitCode | Event::ExitSignal => {
+                                    self.mark_orphans(&children);
+                                    self.ensure_process(&carcass.pid).unwrap();
+                                }
+                                Event::ExitSuccess => {
+                                    // make sure forked processes have their pid updated
+                                    if children.len() > 0 {
+                                        self.update_ensured_process_pid(&carcass.pid, &children[0]);
+                                    }
+                                }
                             }
-                            // remove pid from orphans if it exists
+
+                            // finally remove pid from orphans if it exists
                             if self.orphans.contains_key(&carcass.pid) {
                                 debug!("Reaped orphan (pid={})", carcass.pid);
                                 self.orphans.remove(&carcass.pid);
@@ -219,21 +290,20 @@ impl Reaper {
             }
 
             // deadline expired
-            trace!("transitioning orphans");
             self.transition_orphans();
         }
     }
 
     /// Mark and sweep all children of the given process ID. The children are gathered and signaled
     /// to exit.
-    fn mark_children(&mut self, pid: Pid) {
-        let children = list_children(pid);
-        for child in &children {
+    fn mark_orphans(&mut self, orphans: &[Pid]) {
+        for child in orphans {
             let _ = self
                 .orphans
                 .insert(*child, OrphanState::BlissfulIgnorance(*child));
         }
-        trace!("Marked {} children for termination", children.len());
+
+        trace!("Marked {} children for termination", orphans.len());
         self.transition_orphans();
     }
 
@@ -243,5 +313,54 @@ impl Reaper {
         }
 
         trace!("Transitioned {} orphans", self.orphans.len());
+    }
+
+    /// get a list of all new children since the last time this method is called, and remember
+    /// all current children
+    fn new_children(&mut self) -> Vec<Pid> {
+        trace!("Finding children we don't know about yet");
+
+        let all_children = list_children(self.pid);
+
+        let new_children = all_children
+            .iter()
+            .filter(|p| !self.children.contains(p))
+            .map(|p| *p)
+            .collect();
+
+        // remember the new children
+        self.children = all_children;
+
+        new_children
+    }
+
+    fn ensure_process(&mut self, pid: &Pid) -> Result<(), std::io::Error> {
+        if let Some(cmd) = self.persistent_commands_map.remove(pid) {
+            self.spawn_child(&cmd.0, &cmd.1)?;
+        }
+        Ok(())
+    }
+
+    fn update_ensured_process_pid(&mut self, pid: &Pid, new_pid: &Pid) {
+        if let Some(cmd) = self.persistent_commands_map.remove(pid) {
+            let _ = self.persistent_commands_map.insert(*new_pid, cmd);
+        }
+    }
+
+    fn spawn_child(&mut self, cmd: &str, args: &str) -> Result<(), std::io::Error> {
+        debug!("Spawning child {}", cmd);
+
+        let mut command = Command::new(cmd);
+        command.args(args.split_whitespace());
+
+        let id = command.spawn().map(|child| child.id())?;
+
+        info!("Spawned child {} {} (pid={})", cmd, args, id);
+
+        self.persistent_commands_map.insert(
+            Pid::from_raw(id as i32),
+            Cmd(String::from(cmd), String::from(args)),
+        );
+        Ok(())
     }
 }
