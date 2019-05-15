@@ -144,6 +144,17 @@ fn transition_orphan(os: OrphanState) -> OrphanState {
     }
 }
 
+/// A process reaper
+///
+/// # Use
+///
+/// The `Reaper` traps SIGCHLD signals and uses these as an indicator that it potentially needs
+/// to reap a zombie. Upon reaping a zombie, the `Reaper` attempts to identify the children of the
+/// zombie and, based on the reason the zombie died, decides whether or not the orphans should be
+/// exterminated or not.
+///
+/// It is possible to start the `Reaper` with a list of processes which should be kept alive,
+/// and revive them if necessary. A protected process' pid is tracked accross forks.
 pub struct Reaper {
     orphans: HashMap<Pid, OrphanState>,
     children: Vec<Pid>,
@@ -163,11 +174,18 @@ enum Event {
 struct Cmd(String, String);
 
 impl Reaper {
+    /// Create a new [`Reaper`].
+    ///
+    /// It is required that this method is called on the main thread of the process, as it
+    /// sets up a Trap which captures the SIGCHLD signal. The signal is captured as soon
+    /// as this function is called, even before the [`Reaper`] is [`spawned`].
+    ///
+    /// [`Reaper`]: struct.Reaper.html
+    /// [`spawned`]: struct.Reaper.html#method.spawn
     pub fn new() -> Self {
         Reaper {
             orphans: HashMap::new(),
             children: Vec::new(),
-            // TODO document in reaper new that this must be called on the main thread
             trap: Trap::trap(&[SIGCHLD, SIGINT, SIGTERM]),
 
             persistent_commands_map: HashMap::new(),
