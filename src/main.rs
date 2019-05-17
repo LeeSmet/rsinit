@@ -1,3 +1,4 @@
+use librsinit::PersistentCommand;
 use simplelog::*;
 use std::fs::OpenOptions;
 
@@ -21,8 +22,18 @@ fn main() {
     ])
     .expect("Failed to set up logger");
 
+    let mut persistent_commands = Vec::with_capacity(PROCESSES.len());
+    for (cmd, args) in &PROCESSES {
+        persistent_commands.push(
+            PersistentCommand::new(cmd, args)
+                .spawn_limit(10)
+                .restart_on_error(true)
+                .restart_on_signal(true)
+                .restart_on_success(true),
+        );
+    }
     // Start reaper
     let reaper = librsinit::Reaper::new();
 
-    reaper.spawn(&PROCESSES);
+    reaper.spawn(persistent_commands);
 }
