@@ -211,7 +211,11 @@ impl<'a> Reaper<'a> {
                 match signal {
                     SIGCHLD => {
                         // received sigchld, try to get a carcass
-                        if let Some(carcass) = reap() {
+                        // a single signal can be used for multiple dead children, so keep reaping
+                        // untill we got them all. If this captures dead children from a subsequent
+                        // signal, then reaping will fail on that signal so no more action will be
+                        // taken.
+                        while let Some(carcass) = reap() {
                             // got a dead process
                             let event = match carcass {
                                 // if the process exited normally, i.e. exit code 0, everything is fine
