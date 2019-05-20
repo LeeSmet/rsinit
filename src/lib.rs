@@ -8,7 +8,6 @@ use std::io::Read;
 use std::time::Duration;
 use std::time::Instant;
 
-use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getpid, Pid};
@@ -104,48 +103,6 @@ fn list_children(parent: Pid) -> Vec<Pid> {
         .collect()
 }
 
-#[derive(Clone, Debug)]
-enum OrphanState {
-    BlissfulIgnorance(Pid),
-    HasBeenSentSIGTERM(Pid),
-    HasBeenSentSIGKILL(Pid, Instant),
-    Errored(Pid, nix::Error),
-}
-
-fn transition_orphan(os: OrphanState) -> OrphanState {
-    match os {
-        OrphanState::BlissfulIgnorance(pid) => {
-            info!("sending SIGTERM to orphan (pid={})", pid);
-            match kill(pid, Some(SIGTERM)) {
-                Ok(()) => OrphanState::HasBeenSentSIGTERM(pid),
-                Err(e) => {
-                    warn!("unable to send SIGTERM to orphan (pid={}): {}", pid, e);
-                    OrphanState::Errored(pid, e)
-                }
-            }
-        }
-        OrphanState::HasBeenSentSIGTERM(pid) => {
-            info!("sending SIGKILL to orphan (pid={})", pid);
-            match kill(pid, Some(SIGKILL)) {
-                Ok(()) => OrphanState::HasBeenSentSIGKILL(pid, Instant::now()),
-                Err(e) => {
-                    warn!("unable to send SIGKILL to orphan (pid={}): {}", pid, e);
-                    OrphanState::Errored(pid, e)
-                }
-            }
-        }
-        OrphanState::HasBeenSentSIGKILL(pid, i) => {
-            warn!(
-                "orphan ({}) lingering (since {}s) after SIGKILL",
-                pid,
-                i.elapsed().as_secs()
-            );
-            os
-        }
-        os @ OrphanState::Errored(_, _) => os,
-    }
-}
-
 /// A process reaper
 ///
 /// # Use
@@ -158,13 +115,12 @@ fn transition_orphan(os: OrphanState) -> OrphanState {
 /// It is possible to start the `Reaper` with a list of processes which should be kept alive,
 /// and revive them if necessary. A protected process' pid is tracked accross forks.
 pub struct Reaper<'a> {
-    orphans: HashMap<Pid, OrphanState>,
     children: Vec<Pid>,
     trap: Trap,
 
     persistent_commands_map: HashMap<Pid, PersistentCommand<'a>>,
 
-    pid: Pid,
+    pid: Pid, // own process id
 }
 
 impl<'a> Reaper<'a> {
@@ -178,7 +134,6 @@ impl<'a> Reaper<'a> {
     /// [`spawned`]: struct.Reaper.html#method.spawn
     pub fn new() -> Self {
         Reaper {
-            orphans: HashMap::new(),
             children: Vec::new(),
             trap: Trap::trap(&[SIGCHLD, SIGINT, SIGTERM]),
 
@@ -204,6 +159,8 @@ impl<'a> Reaper<'a> {
         let _ = self.new_children(); // make sure we know about these processes
 
         loop {
+            // keep the outer loop for now, might want to move some runtime addition of cmds in
+            // here at a later stage
             let deadline = Instant::now() + Duration::from_secs(5);
 
             while let Some(signal) = self.trap.wait(deadline) {
@@ -265,7 +222,7 @@ impl<'a> Reaper<'a> {
                             // see if the children need to be marked
                             match event {
                                 Event::ExitCode | Event::ExitSignal => {
-                                    self.mark_orphans(&children);
+                                    // Do we need to update the tracked processes here?
                                 }
                                 Event::ExitSuccess => {
                                     // make sure forked processes have their pid updated
@@ -289,41 +246,12 @@ impl<'a> Reaper<'a> {
                                     }
                                 }
                             }
-
-                            // finally remove pid from orphans if it exists
-                            if self.orphans.contains_key(&carcass.pid) {
-                                debug!("Reaped orphan (pid={})", carcass.pid);
-                                self.orphans.remove(&carcass.pid);
-                            }
                         }
                     }
                     s => debug!("Ignoring signal {:?}", s),
                 }
             }
-
-            // deadline expired
-            self.transition_orphans();
         }
-    }
-
-    /// Mark and sweep all children of the given process ID. The children are gathered and signaled
-    /// to exit.
-    fn mark_orphans(&mut self, orphans: &[Pid]) {
-        for child in orphans {
-            let _ = self
-                .orphans
-                .insert(*child, OrphanState::BlissfulIgnorance(*child));
-        }
-
-        trace!("Marked {} children for termination", orphans.len());
-    }
-
-    fn transition_orphans(&mut self) {
-        for orphan_state in self.orphans.values_mut() {
-            *orphan_state = transition_orphan(orphan_state.to_owned());
-        }
-
-        trace!("Transitioned {} orphans", self.orphans.len());
     }
 
     /// get a list of all new children since the last time this method is called, and remember
